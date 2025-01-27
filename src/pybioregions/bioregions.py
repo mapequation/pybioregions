@@ -2,7 +2,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-import shapely
+import geodatasets as gds
 import networkx as nx
 
 # import datatable as dt
@@ -139,7 +139,7 @@ def clamp(x, vmax=None, vmin=None, where=True):
     return a
 
 
-def find_communities(
+def find_communities_simple(
     G: nx.Graph | str,
     silent=True,
     initial_partition=None,
@@ -206,6 +206,146 @@ def find_communities(
     return im.get_dataframe(
         ["state_id", "node_id", "name", "module_id", "path", "flow"]
     ).set_index("state_id")
+
+
+def find_communities(
+    G,
+    verbose=False,
+    silent=True,
+    initial_partition=None,
+    tree_output=None,
+    depth_level=1,
+    return_im=False,
+    return_dataframe=False,
+    phys_id=None,
+    layer_id=None,
+    multilayer_inter_intra_format=True,
+    store_json_output=False,
+    community_attribute="community",
+    **infomap_args,
+):
+    """
+    Partition network with the Infomap algorithm.
+    Annotates nodes with 'community' id and 'flow'.
+    """
+
+    if phys_id is None:
+        phys_id = "phys_id"
+    if layer_id is None:
+        layer_id = "layer_id"
+
+    phys_ids = dict(G.nodes.data(phys_id))
+    is_state_network = None not in phys_ids.values()
+    layer_ids = dict(G.nodes.data(layer_id))
+    is_multilayer_network = None not in layer_ids.values()
+
+    im = infomap.Infomap(silent=silent, **infomap_args)
+
+    node_map = im.add_networkx_graph(G)
+    # node_map = im.add_networkx_graph(G, phys_id=phys_id, multilayer_inter_intra_format=multilayer_inter_intra_format)
+    # node_map = add_networkx_graph(
+    #     im,
+    #     G,
+    #     phys_id=phys_id,
+    #     layer_id=layer_id,
+    #     multilayer_inter_intra_format=multilayer_inter_intra_format,
+    # )
+    # TODO: Remap nodes to state ids if multilayer?
+    # is_state_network = phys_id is not None
+    # add_networkx_graph(im, G, phys_id=phys_id)
+
+    im.run(initial_partition=initial_partition)
+
+    if return_im:
+        return im
+
+    # Store result on nodes and graph
+    communities = im.get_modules(depth_level=depth_level, states=is_state_network)
+    num_modules = np.unique(list(communities.values())).shape[0]
+
+    if store_json_output:
+        # with tempfile.TemporaryDirectory() as tmp:
+        #     json_filename = Path(tmp).joinpath('infomap_output.json')
+        json_filename = "output/temp/infomap_output.json"
+        im.write_json(json_filename)
+        with open(json_filename, "r") as fp:
+            G.graph["output"] = json.load(fp)
+
+    if verbose:
+        print(
+            f"Found {num_modules} modules in {im.max_depth} levels with codelength {im.codelength} (savings: {im.relative_codelength_savings:.3%})"
+        )
+
+    if is_multilayer_network:
+        # node_map maps (layer_id, phys_id) -> state_id
+        multilayer_node_to_nx_id = {
+            (d["layer_id"], d["phys_id"]): n for n, d in G.nodes.data()
+        }
+        flow = {
+            multilayer_node_to_nx_id[(node.layer_id, node.node_id)]: node.data.flow
+            for node in im.nodes
+        }
+        # link_flow = {(source, target): flow for source, target, flow in im.get_links(data="flow")}
+        # 2024-05-14, TODO: FIX: below gives KeyError: (1, 11) for StarWars.net
+        for _, d in G.nodes.data():
+            d["state_id"] = node_map[(d["layer_id"], d["phys_id"])]
+    else:
+        flow = {node.state_id: node.data.flow for node in im.nodes}
+        link_flow = {
+            (source, target): flow for source, target, flow in im.get_links(data="flow")
+        }
+        nx.set_edge_attributes(G, link_flow, "flow")
+
+    nx.set_node_attributes(G, communities, community_attribute)
+    nx.set_node_attributes(G, flow, "flow")
+    G.graph["N"] = im.num_nodes
+    G.graph["E"] = im.num_links
+    G.graph["num_modules"] = num_modules
+    G.graph["effective_num_modules"] = im.get_effective_num_modules(
+        depth_level=depth_level
+    )
+    G.graph["L"] = im.codelength
+    G.graph["L_ind"] = im.index_codelength
+    G.graph["L_mod"] = im.module_codelength
+    G.graph["L_0"] = im.one_level_codelength
+    G.graph["savings"] = im.relative_codelength_savings
+    G.graph["max_depth"] = im.max_depth
+    G.graph["modules"] = pd.DataFrame(
+        im.get_multilevel_modules(states=is_state_network)
+    ).T
+    G.graph["modules_old"] = im.get_multilevel_modules(states=is_state_network)
+    # G.graph['multimodules'] = get_multilevel_modules(im)
+    G.graph["effective_num_modules_per_level"] = [
+        im.get_effective_num_modules(lvl) for lvl in range(1, im.max_depth)
+    ]
+    # G.graph["effective_num_nodes"] = calc_effective_number_of_nodes(G)
+    # G.graph['entropy_rate'] = calc_entropy_rate(G)
+
+    data = []
+    for node in im.tree:
+        if node.depth != 1:
+            continue
+        data.append(
+            [node.path[0], node.data.flow, node.data.exitFlow, node.data.enterFlow]
+        )
+    G.graph["module_flow"] = pd.DataFrame(
+        data, columns=["module_id", "flow", "exit", "enter"]
+    ).set_index("module_id")
+    G.graph["flow"] = (
+        pd.DataFrame({"flow": flow.values(), "node_id": flow.keys()})
+        .set_index("node_id")
+        .sort_index()
+    )
+
+    if tree_output is not None:
+        im.write_tree(tree_output)
+        print(f"Wrote tree to '{tree_output}'")
+
+    if return_dataframe:
+        return im.get_dataframe(
+            ["state_id", "node_id", "name", "module_id", "path", "flow"]
+        ).set_index("state_id")
+    return num_modules, im.codelength
 
 
 def crop_cmap(
@@ -582,7 +722,7 @@ def buffer_gdf(gdf, buffer=0.1):
 class Bioregions:
     def __init__(
         self,
-        occurrence_file: str,
+        occurrence_input: str | pd.DataFrame,
         sep=",",
         resolution: float = 1,
         plot_width=10,
@@ -591,7 +731,7 @@ class Bioregions:
         latlong_cols=["latitude", "longitude"],
         species_col="species",
     ):
-        self.occurrence_file = occurrence_file
+        self.occurrence_input = occurrence_input
         self.sep = sep
         self.resolution = resolution
         self.plot_width = plot_width
@@ -607,7 +747,11 @@ class Bioregions:
 
     def init(self):
         resolution = self.resolution
-        df = pd.read_csv(self.occurrence_file, sep=self.sep, encoding=self.encoding)
+        df = (
+            pd.read_csv(self.occurrence_input, sep=self.sep, encoding=self.encoding)
+            if isinstance(self.occurrence_input, str)
+            else self.occurrence_input.copy()
+        )
         # self.bbox = df.describe().loc[['min', 'max']]
         species_col = self.species_col
 
@@ -1305,7 +1449,7 @@ class Bioregions:
         ax.axis("off")
 
         if add_worldmap or self.add_worldmap:
-            worldmap = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+            worldmap = gpd.read_file(gds.get_path("naturalearth land"))
             worldmap.plot(color="lightgrey", alpha=0.5, ax=ax)
 
         num_bioregions = self.num_bioregions_per_level[level]
@@ -1608,7 +1752,7 @@ class BiodiversityMetrics:
         return self.df_cells[self.metrics_z]
 
     def init(self):
-        G = data.read_pajek(self.network_file)
+        G = read_pajek(self.network_file)
         print(f"Parsed network with {get_N(G)} nodes and {get_E(G)} edges.")
         im = infomap.Infomap(no_infomap=True, silent=True)
         im.read_file(self.network_file)

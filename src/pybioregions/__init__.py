@@ -1,1 +1,3 @@
-from . import bioregions
+from . import *
+
+# __all__ = ["bioregions"]

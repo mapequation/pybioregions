@@ -1,0 +1,13 @@
+numpy
+pandas
+infomap
+shapely
+geopandas
+geodatasets
+scipy
+scikit-learn
+libpysal
+topojson
+matplotlib
+seaborn
+coloraide
