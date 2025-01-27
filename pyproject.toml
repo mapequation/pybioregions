@@ -1,0 +1,12 @@
+[project]
+name = "pybioregions"
+version = "0.1.0"
+description = "Infomap Bioregions in Python"
+readme = "README.md"
+authors = [{ name = "Daniel Edler", email = "edler.dev@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
