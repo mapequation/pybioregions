@@ -730,6 +730,9 @@ class Bioregions:
         encoding="utf-8",
         latlong_cols=["latitude", "longitude"],
         species_col="species",
+        drop_other_columns=True,
+        csv_engine="pyarrow",  # for pandas.read_csv, default is "c"
+        nrows=None,  # limit the number of occurrence records
     ):
         self.occurrence_input = occurrence_input
         self.sep = sep
@@ -742,76 +745,127 @@ class Bioregions:
         self.encoding = encoding
         self.latlong_cols = latlong_cols
         self.species_col = species_col
+        self.drop_other_columns = drop_other_columns
+        self.csv_engine = csv_engine
+        self.nrows = nrows
         self.cluster_data = dict()
         self.init()
 
     def init(self):
         resolution = self.resolution
+        usecols = (
+            [self.species_col] + self.latlong_cols if self.drop_other_columns else None
+        )
+        read_file = isinstance(self.occurrence_input, str)
+        if read_file:
+            print(f"Read file '{self.occurrence_input}'...")
+
         df = (
-            pd.read_csv(self.occurrence_input, sep=self.sep, encoding=self.encoding)
-            if isinstance(self.occurrence_input, str)
+            pd.read_csv(
+                self.occurrence_input,
+                sep=self.sep,
+                encoding=self.encoding,
+                engine=self.csv_engine if not self.nrows else "c",
+                nrows=self.nrows,
+                usecols=usecols,
+            )
+            if read_file
             else self.occurrence_input.copy()
         )
+        df[self.latlong_cols[0]] = pd.to_numeric(
+            df[self.latlong_cols[0]], errors="coerce"
+        )
+        df[self.latlong_cols[1]] = pd.to_numeric(
+            df[self.latlong_cols[1]], errors="coerce"
+        )
+        N = df.shape[0]
+        print(f"Got {N} occurrence records.")
+        df = df.dropna()
+        if df.shape[0] < N:
+            print(
+                f"Dropped {N - df.shape[0]} records with missing or wrong type of values"
+            )
+            N = df.shape[0]
         # self.bbox = df.describe().loc[['min', 'max']]
         species_col = self.species_col
 
         df["count"] = 1
-        df_species = df[[species_col, "count"]].groupby(species_col).count()
+        df_species = pd.DataFrame(
+            df[species_col].value_counts()
+        )  # index name 'species', columns ['count']
         num_species = df_species.shape[0]
         print(f"{num_species} species found!")
         lat, long = self.latlong_cols
 
-        df["ilat"] = df[lat] // resolution
-        df["ilong"] = df[long] // resolution
-        df["ilat_ilong"] = df.apply(lambda row: f"{row['ilat']}_{row['ilong']}", axis=1)
+        print(f"Bin occurrences to grid cells with resolution {resolution} degrees...")
+        df["ilat"] = (df[lat] // resolution).astype(int)
+        df["ilong"] = (df[long] // resolution).astype(int)
+        df["ilat_ilong"] = df["ilat"].astype(str) + "_" + df["ilong"].astype(str)
 
-        cell_ids = df["ilat_ilong"].unique()
-        cell_ids = pd.Series(range(cell_ids.shape[0]), index=cell_ids)
-        df["cell_id"] = df.apply(lambda row: cell_ids.loc[row["ilat_ilong"]], axis=1)
+        df["cell_id"], cell_ids = df["ilat_ilong"].factorize()
 
         df_cells = (
             df[["ilat", "ilong", "ilat_ilong"]]
-            .groupby("ilat_ilong")
-            .agg({"ilat": "first", "ilong": "first"})
+            .drop_duplicates(subset=["ilat_ilong"])
+            .set_index("ilat_ilong")
+            .reindex(cell_ids)
+            .reset_index(names="cell_name")
         )
+        df_cells.index.name = "cell_id"
         num_cells = df_cells.shape[0]
-        df_cells["cell_id"] = cell_ids[df_cells.index]
-        df_cells["cell_name"] = df_cells.index
-        df_cells = df_cells.set_index("cell_id")
         print(f"{num_cells} cells generated!")
 
-        def create_cell(row):
-            lat = row["ilat"] * self.resolution
-            long = row["ilong"] * self.resolution
-            return shapely.geometry.box(
-                long, lat, long + self.resolution, lat + self.resolution
-            )
+        print("Create cell geometry...")
+        # def create_cell(row):
+        #     lat = row["ilat"] * self.resolution
+        #     long = row["ilong"] * self.resolution
+        #     return shapely.geometry.box(
+        #         long, lat, long + self.resolution, lat + self.resolution
+        #     )
 
-        df_cells["geometry"] = df_cells.apply(create_cell, axis=1)
-        df_cells = gpd.GeoDataFrame(df_cells, crs="EPSG:4326")
+        # df_cells["geometry"] = df_cells.apply(create_cell, axis=1)
+        df_cells["geometry"] = gpd.array.from_shapely(
+            [
+                shapely.geometry.box(
+                    long, lat, long + self.resolution, lat + self.resolution
+                )
+                for lat, long in zip(
+                    df_cells["ilat"] * resolution, df_cells["ilong"] * resolution
+                )
+            ]
+        )
+        df_cells = gpd.GeoDataFrame(df_cells, geometry="geometry", crs="EPSG:4326")
+
+        # Initialize module and bioregion columns
         df_cells["module"] = 0
         df_cells["bioregion"] = 0
 
+        # Assign unique IDs to species
         df_species["id"] = np.arange(num_cells, num_cells + num_species, dtype=int)
         df_species["module"] = 0
 
-        df["species_id"] = df.apply(
-            lambda row: df_species.loc[row[species_col], "id"], axis=1
-        )
+        # Map species to IDs in a vectorized way
+        species_to_id = df_species.reset_index().set_index(species_col)["id"]
+        df["species_id"] = df[species_col].map(species_to_id)
 
+        # Update df_species index to be "id"
         df_species = df_species.reset_index().set_index("id")
 
         self.df = df
         self.df_species = df_species  # Index on node id, columns ['species', 'count']
         self.df_cells = df_cells  # Index on node id
 
+        print("Generate network...")
         self.generate_graph()
+        # self.generate_graph_old()
+        print("Generate node data...")
         self.generate_node_data()
         self.init_endemic_count()
 
         # Fix special case for square grid cells
         # self.generate_neighbor_graph()
         # self.generate_mesh()
+        print("Initialization done!")
 
     def init_endemic_count(self):
         k1_species = self.df_species.loc[self.df_species.degree == 1].index
@@ -853,27 +907,42 @@ class Bioregions:
 
     def generate_graph(self, weighted=False, log=True):
         G = nx.Graph()
-        for sp in self.df_species.itertuples():
-            G.add_node(sp.Index, name=sp.species, type="species")
-        for cell in self.df_cells.itertuples():
-            G.add_node(cell.Index, name=cell.cell_name, type="cell")
-        #     for sp in np.unique(cell.species_id):
-        #         G.add_edge(cell.Index, sp)
+
+        # Add species nodes
+        G.add_nodes_from(
+            (
+                (idx, {"name": sp.species, "type": "species"})
+                for idx, sp in self.df_species.iterrows()
+            )
+        )
+
+        # Add cell nodes
+        G.add_nodes_from(
+            (
+                (idx, {"name": cell.cell_name, "type": "cell"})
+                for idx, cell in self.df_cells.iterrows()
+            )
+        )
+
         if not weighted:
-            for record in self.df.itertuples():
-                G.add_edge(record.cell_id, record.species_id)
+            # Add edges without weights
+            edges = list(zip(self.df["cell_id"], self.df["species_id"]))
+            G.add_edges_from(edges)
             self.G = G
             return
 
-        k_species_max = self.df_nodes[self.df_nodes.type == "species"].degree.max()
-        for record in self.df.itertuples():
-            # k_cell = self.df_nodes.loc[record.cell_id, 'degree']
-            k_species = self.df_nodes.loc[record.species_id, "degree"]
-            # weight = k_max / max(k_cell, k_species)
-            weight = k_species_max / k_species
-            if log:
-                weight = np.log2(weight + 0.1)
-            G.add_edge(record.cell_id, record.species_id, weight=weight)
+        # Compute the maximum degree for species nodes
+        k_species_max = self.df_nodes[self.df_nodes.type == "species"]["degree"].max()
+
+        # Compute weights for edges
+        degrees = self.df_nodes.loc[self.df["species_id"], "degree"].values
+        weights = k_species_max / degrees
+        if log:
+            weights = np.log2(weights + 0.1)
+
+        # Add edges with weights
+        edges = zip(self.df["cell_id"], self.df["species_id"], weights)
+        G.add_weighted_edges_from(edges)
         self.G = G
 
     def generate_graph_projected(self, weighted=False):
@@ -1301,6 +1370,7 @@ class Bioregions:
     def partition(self, G=None, **infomap_kwargs):
         if G is None:
             G = self.G
+        print(f"Partition {G}...")
 
         find_communities(G, **infomap_kwargs)
 

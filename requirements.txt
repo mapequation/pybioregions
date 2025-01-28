@@ -11,3 +11,4 @@ topojson
 matplotlib
 seaborn
 coloraide
+pyarrow
