@@ -719,6 +719,27 @@ def buffer_gdf(gdf, buffer=0.1):
     return to_gdf(gdf.iloc[0].geometry.buffer(buffer))
 
 
+def parse_csv(
+    filename: str,
+    sep=",",
+    encoding="utf-8",
+    usecols=None,
+    csv_engine="pyarrow",  # for pandas.read_csv, default is "c"
+    nrows=None,  # limit the number of occurrence records, forces "c" engine
+    **kwargs,  # additional arguments for pd.read_csv
+):
+    df = pd.read_csv(
+        filename,
+        sep=sep,
+        encoding=encoding,
+        usecols=usecols,
+        nrows=nrows,
+        engine=csv_engine if not nrows else "c",
+        **kwargs,
+    )
+    return df
+
+
 class Bioregions:
     def __init__(
         self,
